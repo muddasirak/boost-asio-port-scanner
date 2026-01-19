@@ -1,0 +1,250 @@
+#include <boost/asio.hpp>
+#include <iostream>
+#include <map>
+#include <vector>
+#include <string>
+#include <memory>
+#include <chrono>
+#include <iomanip>
+#include <algorithm>
+#include <mutex>
+
+using boost::asio::ip::tcp;
+
+/*  SERVICE IDENTIFIER  */
+
+
+class ServiceIdentifier {
+private:
+    std::map<int, std::string> services;
+
+public:
+    ServiceIdentifier() {
+        services = {
+            {21, "FTP"}, {22, "SSH"}, {23, "TELNET"}, {25, "SMTP"},
+            {53, "DNS"}, {80, "HTTP"}, {110, "POP3"}, {143, "IMAP"},
+            {443, "HTTPS"}, {445, "SMB"}, {3306, "MySQL"},
+            {3389, "RDP"}, {5432, "PostgreSQL"}, {8080, "HTTP-ALT"}
+        };
+    }
+
+    std::string identify(int port) const {
+        auto it = services.find(port);
+        return (it != services.end()) ? it->second : "Unknown";
+    }
+};
+
+/*  SCAN RESULT  */
+
+
+struct ScanResult {
+    int port;
+    bool open;
+    std::string service;
+    long long responseTime;
+};
+
+/*  PORT SCANNER  */
+
+
+class PortScanner {
+private:
+    boost::asio::io_context& io;
+    tcp::resolver resolver;
+    ServiceIdentifier serviceId;
+    std::vector<ScanResult> results;
+    std::mutex resultsMutex;
+
+    int timeoutSeconds;
+    int pendingScans;
+
+public:
+    PortScanner(boost::asio::io_context& context, int timeout = 2)
+        : io(context),
+          resolver(context),
+          timeoutSeconds(timeout),
+          pendingScans(0) {}
+
+    void scanPort(const std::string& host, int port) {
+        pendingScans++;
+
+        auto socket = std::make_shared<tcp::socket>(io);
+        auto timer  = std::make_shared<boost::asio::steady_timer>(io);
+        auto start  = std::chrono::steady_clock::now();
+
+        resolver.async_resolve(
+            host,
+            std::to_string(port),
+            [=](const boost::system::error_code& ec,
+                tcp::resolver::results_type endpoints) {
+
+                if (ec) {
+                    recordResult(port, false, 0);
+                    return;
+                }
+
+                timer->expires_after(std::chrono::seconds(timeoutSeconds));
+                timer->async_wait([=](const boost::system::error_code& ec) {
+                    if (!ec) {
+                        socket->close();
+                    }
+                });
+
+                boost::asio::async_connect(
+                    *socket,
+                    endpoints,
+                    [=](const boost::system::error_code& ec,
+                        const tcp::endpoint&) {
+
+                        timer->cancel();
+
+                        auto end = std::chrono::steady_clock::now();
+                        long long ms =
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                end - start).count();
+
+                        recordResult(port, !ec, ms);
+                        socket->close();
+                    }
+                );
+            }
+        );
+    }
+
+    void scanRange(const std::string& host, int startPort, int endPort) {
+        reset();
+
+        for (int port = startPort; port <= endPort; ++port) {
+            scanPort(host, port);
+        }
+
+        io.run();
+        io.restart();
+        displayResults();
+    }
+
+    void scanCommon(const std::string& host) {
+        reset();
+
+        int ports[] = {
+            21, 22, 23, 25, 53, 80, 110, 143,
+            443, 445, 3306, 3389, 5432, 8080
+        };
+
+        for (int port : ports) {
+            scanPort(host, port);
+        }
+
+        io.run();
+        io.restart();
+        displayResults();
+    }
+
+private:
+    void reset() {
+        results.clear();
+        pendingScans = 0;
+    }
+
+    void recordResult(int port, bool open, long long time) {
+        std::lock_guard<std::mutex> lock(resultsMutex);
+
+        results.push_back({
+            port,
+            open,
+            open ? serviceId.identify(port) : "",
+            time
+        });
+
+        pendingScans--;
+    }
+
+    void displayResults() {
+        std::sort(results.begin(), results.end(),
+                  [](const ScanResult& a, const ScanResult& b) {
+                      return a.port < b.port;
+                  });
+
+        std::cout << "\nPORT   STATUS   SERVICE        TIME\n";
+        std::cout << "------------------------------------------\n";
+
+        int openCount = 0;
+        for (const auto& r : results) {
+            if (r.open) {
+                std::cout << std::setw(5) << r.port << "   OPEN     "
+                          << std::setw(12) << r.service << " "
+                          << r.responseTime << " ms\n";
+                openCount++;
+            }
+        }
+
+        if (openCount == 0) {
+            std::cout << "No open ports found.\n";
+        }
+
+        std::cout << "\nSummary: "
+                  << openCount << " open ports out of "
+                  << results.size() << "\n";
+    }
+};
+
+/*  APPLICATION  */
+class NetworkScannerApp {
+private:
+    boost::asio::io_context io;
+
+public:
+    void run() {
+        while (true) {
+            int choice;
+            std::string host;
+
+            std::cout << "\n===== NETWORK PORT SCANNER =====\n";
+            std::cout << "1. Scan Port Range\n";
+            std::cout << "2. Scan Common Ports\n";
+            std::cout << "3. Exit\n";
+            std::cout << "Choice: ";
+            std::cin >> choice;
+
+            if (choice == 3) break;
+
+            std::cout << "Enter target host: ";
+            std::cin >> host;
+
+            PortScanner scanner(io);
+
+            if (choice == 1) {
+                int start, end;
+                std::cout << "Start port: ";
+                std::cin >> start;
+                std::cout << "End port: ";
+                std::cin >> end;
+
+                if (start < 1 || end > 65535 || start > end) {
+                    std::cout << "Invalid port range.\n";
+                    continue;
+                }
+
+                scanner.scanRange(host, start, end);
+            }
+            else if (choice == 2) {
+                scanner.scanCommon(host);
+            }
+            else {
+                std::cout << "Invalid choice.\n";
+            }
+        }
+    }
+};
+
+/*  MAIN  */
+int main() {
+    try {
+        NetworkScannerApp app;
+        app.run();
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Fatal error: " << e.what() << "\n";
+    }
+    return 0;
+}
