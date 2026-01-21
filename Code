@@ -12,7 +12,6 @@
 using boost::asio::ip::tcp;
 
 /*  SERVICE IDENTIFIER  */
-/*fuck you*/
 
 class ServiceIdentifier {
 private:
